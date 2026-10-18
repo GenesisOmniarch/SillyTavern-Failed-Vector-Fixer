@@ -25,7 +25,7 @@ import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../slash-command
 
 const MODULE_NAME = 'failed_vector_purger';
 const LOG_PREFIX = 'Failed Vector Purger:';
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 
 const defaultSettings = {
     include_disabled: true,
@@ -37,8 +37,9 @@ const defaultSettings = {
 
 /**
  * 判定結果
- * - complete: すべてのチャンクが保存されている
+ * - complete: 期待されるチャンクがちょうど揃っている（不足・余剰・重複なし）
  * - incomplete: 保存済みチャンクが期待値の部分集合で、不足がある（＝ベクトル化失敗）
+ * - repair: 不足はないが、余剰チャンクや重複登録がある
  * - mismatch: 期待しないチャンクが含まれている（チャンク設定変更・翻訳などで照合不能）
  * - empty: コレクションが空（失敗して 1 チャンクも保存されなかった or 未処理）。
  *   削除は不要だが再ベクトル化が必要なので、要ベクトル化として集計する
@@ -47,6 +48,7 @@ const defaultSettings = {
 const STATUS = Object.freeze({
     COMPLETE: 'complete',
     INCOMPLETE: 'incomplete',
+    REPAIR: 'repair',
     MISMATCH: 'mismatch',
     EMPTY: 'empty',
     ERROR: 'error',
@@ -55,6 +57,7 @@ const STATUS = Object.freeze({
 const STATUS_LABELS = {
     [STATUS.COMPLETE]: '完了',
     [STATUS.INCOMPLETE]: '不完全',
+    [STATUS.REPAIR]: '要修復',
     [STATUS.MISMATCH]: '設定不一致',
     [STATUS.EMPTY]: '未ベクトル化',
     [STATUS.ERROR]: 'エラー',
@@ -231,15 +234,41 @@ function overlapChunks(chunk, index, chunks, overlapSize) {
 }
 
 /**
- * 標準機能の vectorizeFile と同じ手順でチャンクのハッシュ集合を求める。
- * @param {string} fileText
- * @param {number} chunkSize
- * @param {number} overlapPercent
- * @param {object} vs
- * @returns {Set<number>}
+ * ハッシュごとの件数を数える。
+ * @param {number[]} hashes
+ * @returns {Map<number, number>}
  */
-function computeExpectedHashes(fileText, chunkSize, overlapPercent, vs) {
-    return new Set(computeChunkItems(fileText, chunkSize, overlapPercent, vs).map(item => item.hash));
+function countHashes(hashes) {
+    const counts = new Map();
+    for (const hash of hashes) {
+        counts.set(hash, (counts.get(hash) ?? 0) + 1);
+    }
+    return counts;
+}
+
+/**
+ * 期待されるハッシュと保存済みハッシュを件数込みで比較する。
+ * 標準機能は同じ内容のチャンクも件数分保存するので、件数まで一致して初めて完全とみなす。
+ * @param {Map<number, number>} expected
+ * @param {Map<number, number>} saved
+ * @returns {{missing: number, extra: number, duplicate: number}} 不足件数 / 期待外の件数 / 過剰な重複件数
+ */
+function diffHashes(expected, saved) {
+    let missing = 0;
+    let extra = 0;
+    let duplicate = 0;
+
+    for (const [hash, count] of expected) {
+        const have = saved.get(hash) ?? 0;
+        if (have < count) missing += count - have;
+        if (have > count) duplicate += have - count;
+    }
+
+    for (const [hash, count] of saved) {
+        if (!expected.has(hash)) extra += count;
+    }
+
+    return { missing, extra, duplicate };
 }
 
 /**
@@ -340,15 +369,16 @@ async function inspectTarget(target, vs, listBody) {
         disabled: target.disabled,
     };
 
-    // 補完モード用の情報（表示には使わない）
-    Object.defineProperty(result, 'plan', { value: { target, savedSet: new Set(), text: null, variant: null }, enumerable: false });
+    // 補完・修復用の情報（表示には使わない）
+    Object.defineProperty(result, 'plan', { value: { target, savedCounts: new Map(), text: null, variant: null }, enumerable: false });
 
     try {
-        const savedSet = new Set(await getSavedHashes(collectionId, listBody));
-        result.saved = savedSet.size;
-        result.plan.savedSet = savedSet;
+        const savedHashes = await getSavedHashes(collectionId, listBody);
+        const savedCounts = countHashes(savedHashes);
+        result.saved = savedHashes.length;
+        result.plan.savedCounts = savedCounts;
 
-        if (savedSet.size === 0) {
+        if (savedHashes.length === 0) {
             result.status = STATUS.EMPTY;
             result.message = result.disabled
                 ? '無効化中のため標準機能は処理しません'
@@ -374,12 +404,11 @@ async function inspectTarget(target, vs, listBody) {
         let best = null;
         for (const text of texts) {
             for (const variant of target.variants) {
-                const expected = computeExpectedHashes(text, variant.chunkSize, variant.overlap, vs);
-                const missing = [...expected].filter(h => !savedSet.has(h)).length;
-                const extra = [...savedSet].filter(h => !expected.has(h)).length;
-                const candidate = { expected: expected.size, missing, extra, text, variant };
+                const items = computeChunkItems(text, variant.chunkSize, variant.overlap, vs);
+                const diff = diffHashes(countHashes(items.map(x => x.hash)), savedCounts);
+                const candidate = { expected: items.length, text, variant, ...diff };
 
-                if (!best || extra < best.extra || (extra === best.extra && missing < best.missing)) {
+                if (!best || candidate.extra < best.extra || (candidate.extra === best.extra && candidate.missing < best.missing)) {
                     best = candidate;
                 }
             }
@@ -389,15 +418,14 @@ async function inspectTarget(target, vs, listBody) {
         result.plan.text = best.text;
         result.plan.variant = best.variant;
 
-        if (best.missing === 0 && best.extra === 0) {
+        if (best.missing === 0 && best.extra === 0 && best.duplicate === 0) {
             result.status = STATUS.COMPLETE;
-        } else if (best.extra === 0) {
+        } else if (best.extra === 0 && best.missing > 0) {
             result.status = STATUS.INCOMPLETE;
-            result.message = `${best.missing} チャンク不足`;
+            result.message = `${best.missing} チャンク不足` + (best.duplicate ? ` / 重複 ${best.duplicate}` : '');
         } else if (best.missing === 0) {
-            // 期待チャンクはすべて揃っている（古い余剰チャンクのみ）
-            result.status = STATUS.COMPLETE;
-            result.message = `余剰 ${best.extra} チャンク`;
+            result.status = STATUS.REPAIR;
+            result.message = [best.extra && `余剰 ${best.extra} チャンク`, best.duplicate && `重複 ${best.duplicate} チャンク`].filter(Boolean).join(' / ');
         } else {
             result.status = STATUS.MISMATCH;
             result.message = vs.translate_files
@@ -426,7 +454,7 @@ function needsVectorize(result) {
 function summarize(results) {
     const count = status => results.filter(r => r.status === status).length;
     return `完了 ${count(STATUS.COMPLETE)} / 不完全 ${count(STATUS.INCOMPLETE)} / 未ベクトル化 ${results.filter(needsVectorize).length}`
-        + ` / 設定不一致 ${count(STATUS.MISMATCH)} / エラー ${count(STATUS.ERROR)}`;
+        + ` / 要修復 ${count(STATUS.REPAIR)} / 設定不一致 ${count(STATUS.MISMATCH)} / エラー ${count(STATUS.ERROR)}`;
 }
 
 function isPurgeTarget(result) {
@@ -627,19 +655,41 @@ async function insertBatchWithRetry(collectionId, batch, vs, retries) {
 }
 
 /**
- * 1 ファイル分の不足チャンクを補完する。
+ * 指定したハッシュのチャンクをコレクションから削除する。
+ * @param {string} collectionId
+ * @param {number[]} hashes
+ * @param {object} vs
+ */
+async function deleteHashes(collectionId, hashes, vs) {
+    const body = await getListRequestBody(vs);
+    const response = await fetch('/api/vector/delete', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ ...body, collectionId, hashes }),
+    });
+
+    if (!response.ok) {
+        throw new Error(`余剰チャンクの削除に失敗しました（HTTP ${response.status}）`);
+    }
+}
+
+/**
+ * 1 ファイル分を、標準機能で一度に作った場合と同じ状態に近づける。
+ * - 不足しているチャンクを追加する
+ * - cleanup が true のときは、期待外のチャンクと過剰な重複も削除する
  * @param {ScanResult} result
  * @param {object} vs
  * @param {(done: number, total: number) => void} onProgress
- * @returns {Promise<{inserted: number, failed: {index: number, length: number, error: string}[]}>}
+ * @param {{cleanup?: boolean}} options
+ * @returns {Promise<{inserted: number, deleted: number, failed: {index: number, length: number, error: string}[]}>}
  */
-async function fillMissing(result, vs, onProgress) {
+async function repairTarget(result, vs, onProgress, { cleanup = false } = {}) {
     if (vs.translate_files) {
-        throw new Error('Vector Storage の「Translate files」が有効なため補完できません');
+        throw new Error('Vector Storage の「Translate files」が有効なため補完・修復できません');
     }
 
     if (vs.source === 'webllm') {
-        throw new Error('WebLLM は補完モードに対応していません');
+        throw new Error('WebLLM は補完・修復に対応していません');
     }
 
     const plan = result.plan;
@@ -655,19 +705,64 @@ async function fillMissing(result, vs, onProgress) {
         throw new Error('ファイル本文を取得できませんでした');
     }
 
-    const items = computeChunkItems(text, variant.chunkSize, variant.overlap, vs).filter(item => !plan.savedSet.has(item.hash));
+    const items = computeChunkItems(text, variant.chunkSize, variant.overlap, vs);
+    const byHash = new Map();
+    for (const item of items) {
+        byHash.set(item.hash, [...(byHash.get(item.hash) ?? []), item]);
+    }
+
+    const toDelete = [];
+    const toInsert = [];
+
+    if (cleanup) {
+        for (const hash of plan.savedCounts.keys()) {
+            if (!byHash.has(hash)) {
+                toDelete.push(hash);
+            }
+        }
+    }
+
+    for (const [hash, group] of byHash) {
+        const have = plan.savedCounts.get(hash) ?? 0;
+        if (have === group.length) {
+            continue;
+        }
+
+        if (have > group.length) {
+            // 過剰な重複: ハッシュ単位でしか削除できないので、消してから必要数だけ入れ直す
+            if (cleanup) {
+                toDelete.push(hash);
+                toInsert.push(...group);
+            }
+            continue;
+        }
+
+        toInsert.push(...group.slice(have));
+    }
+
+    toInsert.sort((a, b) => a.index - b.index);
+
+    let deleted = 0;
+    if (toDelete.length) {
+        await deleteHashes(result.collectionId, toDelete, vs);
+        for (const hash of toDelete) {
+            deleted += plan.savedCounts.get(hash) ?? 0;
+            plan.savedCounts.delete(hash);
+        }
+    }
+
     const retries = Math.max(0, Number(getSettings().fill_retries) || 0);
     const batchSize = getBatchSize(vs);
     const failed = [];
     let inserted = 0;
 
-    for (let i = 0; i < items.length; i += batchSize) {
+    for (let i = 0; i < toInsert.length; i += batchSize) {
         if (cancelRequested) {
             break;
         }
 
-        onProgress(i, items.length);
-        const batch = items.slice(i, i + batchSize);
+        onProgress(i, toInsert.length);
+        const batch = toInsert.slice(i, i + batchSize);
         const batchFailed = await insertBatchWithRetry(result.collectionId, batch, vs, retries);
 
         for (const item of batch) {
@@ -677,20 +772,24 @@ async function fillMissing(result, vs, onProgress) {
                 console.error(LOG_PREFIX, `Chunk #${item.index} of ${result.name} (${item.text.length} chars) failed: ${failure.error}`, item.text);
             } else {
                 inserted++;
-                plan.savedSet.add(item.hash);
+                plan.savedCounts.set(item.hash, (plan.savedCounts.get(item.hash) ?? 0) + 1);
             }
         }
     }
 
-    onProgress(items.length, items.length);
-    return { inserted, failed };
+    onProgress(toInsert.length, toInsert.length);
+    return { inserted, deleted, failed };
 }
 
 /**
- * 検査して、不完全・未ベクトル化のファイルを補完する。
- * @returns {Promise<{files: number, inserted: number, failed: number}>}
+ * 検査して、対象ファイルを補完（fill）または整合性修復（repair）する。
+ * - fill: 不完全・未ベクトル化のファイルに不足チャンクを追加するだけ（削除しない）
+ * - repair: 上記に加えて要修復・設定不一致のファイルも対象にし、余剰・重複チャンクを削除する
+ * 最後に検査し直し、実際に保存されている内容で結果を判定する。
+ * @param {{mode?: 'fill'|'repair', silent?: boolean}} options
+ * @returns {Promise<{files: number, inserted: number, deleted: number, failed: number, ok: boolean}>}
  */
-async function scanAndFill({ silent = false } = {}) {
+async function scanAndRepair({ mode = 'fill', silent = false } = {}) {
     if (busy) {
         throw new Error('処理中です');
     }
@@ -704,26 +803,33 @@ async function scanAndFill({ silent = false } = {}) {
     setBusyUi(true);
     $('#fvp_cancel').show();
 
+    const cleanup = mode === 'repair';
+    const title = cleanup ? '整合性を修復中' : '不足チャンクを補完中';
     const toastBody = $('<span>').text('検査中...');
-    const toast = toastr.info(toastBody, '不足チャンクを補完中', { timeOut: 0, extendedTimeOut: 0, closeButton: false, escapeHtml: false });
+    const toast = toastr.info(toastBody, title, { timeOut: 0, extendedTimeOut: 0, closeButton: false, escapeHtml: false });
     let inserted = 0;
+    let deleted = 0;
     let failed = 0;
     let files = 0;
 
     try {
         const vs = getVectorSettings();
         const results = await scan();
-        const targets = results.filter(r => r.status === STATUS.INCOMPLETE || needsVectorize(r));
+        const statuses = cleanup
+            ? [STATUS.INCOMPLETE, STATUS.REPAIR, STATUS.MISMATCH]
+            : [STATUS.INCOMPLETE];
+        const targets = results.filter(r => statuses.includes(r.status) || needsVectorize(r));
 
         for (let i = 0; i < targets.length && !cancelRequested; i++) {
             const result = targets[i];
             files++;
 
             try {
-                const outcome = await fillMissing(result, vs, (done, total) => {
+                const outcome = await repairTarget(result, vs, (done, total) => {
                     toastBody.text(`ファイル ${i + 1}/${targets.length}: ${result.name} — ${done}/${total} チャンク`);
-                });
+                }, { cleanup });
                 inserted += outcome.inserted;
+                deleted += outcome.deleted;
                 failed += outcome.failed.length;
 
                 if (outcome.failed.length) {
@@ -733,7 +839,7 @@ async function scanAndFill({ silent = false } = {}) {
             } catch (error) {
                 failed++;
                 result.message = String(error?.message || error);
-                console.error(LOG_PREFIX, `Fill failed for ${result.name}`, error);
+                console.error(LOG_PREFIX, `${mode} failed for ${result.name}`, error);
             }
         }
 
@@ -747,14 +853,24 @@ async function scanAndFill({ silent = false } = {}) {
         }
         renderResults();
 
+        // 無効化中で空のもの以外がすべて「完了」なら整合性 OK
+        const checked = rescanned.filter(r => !(r.disabled && r.status === STATUS.EMPTY));
+        const ok = checked.every(r => r.status === STATUS.COMPLETE);
+
         if (!silent) {
             const summary = summarize(rescanned);
-            const head = cancelRequested ? '中止しました。' : '補完が終わりました。';
-            const type = failed || cancelRequested ? 'warning' : 'success';
-            toastr[type](`${head}追加 ${inserted} チャンク / 失敗 ${failed}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false, timeOut: 10000 });
+            const counts = `追加 ${inserted} / 削除 ${deleted} / 失敗 ${failed} チャンク`;
+            if (cancelRequested) {
+                toastr.warning(`中止しました。${counts}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false, timeOut: 10000 });
+            } else if (ok) {
+                toastr.success(`整合性 OK：${checked.length} 件すべて完全です。${counts}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false, timeOut: 10000 });
+            } else {
+                const ng = checked.filter(r => r.status !== STATUS.COMPLETE).length;
+                toastr.error(`整合性 NG：${ng} 件が完全ではありません。一覧を確認してください。${counts}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false, timeOut: 0, extendedTimeOut: 0, closeButton: true });
+            }
         }
 
-        return { files, inserted, failed };
+        return { files, inserted, deleted, failed, ok };
     } finally {
         toastr.clear(toast);
         busy = false;
@@ -797,10 +913,11 @@ async function scanAndPurge({ dryRun = false, silent = false, revectorize = getS
 
         if (!silent) {
             const summary = summarize(results);
-            if (!targets.length && !pending) {
+            const allComplete = results.every(r => r.status === STATUS.COMPLETE || (r.disabled && r.status === STATUS.EMPTY));
+            if (allComplete) {
                 toastr.success(`すべてのファイルのベクトル化が完了しています。<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
-            } else if (dryRun) {
-                toastr.warning(`削除候補 ${targets.length} 件 / 要ベクトル化 ${pending} 件<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
+            } else if (dryRun || (!targets.length && !pending)) {
+                toastr.warning(`削除候補 ${targets.length} 件 / 要ベクトル化 ${pending} 件。要修復・エラーは一覧を確認してください。<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
             } else {
                 const next = willRevectorize ? '再ベクトル化を開始します。' : '「再ベクトル化」を実行してください。';
                 toastr.warning(`${purged} 件を削除しました。要ベクトル化 ${pending} 件。${next}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
@@ -837,11 +954,11 @@ function renderResults() {
         return;
     }
 
-    const order = [STATUS.INCOMPLETE, STATUS.EMPTY, STATUS.MISMATCH, STATUS.ERROR, STATUS.COMPLETE];
+    const order = [STATUS.INCOMPLETE, STATUS.EMPTY, STATUS.REPAIR, STATUS.MISMATCH, STATUS.ERROR, STATUS.COMPLETE];
     const sorted = [...lastResults].sort((a, b) => order.indexOf(a.status) - order.indexOf(b.status));
 
     for (const result of sorted) {
-        const selectable = result.status === STATUS.INCOMPLETE || result.status === STATUS.MISMATCH;
+        const selectable = [STATUS.INCOMPLETE, STATUS.REPAIR, STATUS.MISMATCH].includes(result.status);
         const checked = isPurgeTarget(result) ? 'checked' : '';
         const progress = result.expected ? `${result.saved} / ${result.expected}` : `${result.saved}`;
         const row = $(`
@@ -922,7 +1039,16 @@ async function onScanAndPurgeClick() {
 
 async function onFillClick() {
     try {
-        await scanAndFill();
+        await scanAndRepair({ mode: 'fill' });
+    } catch (error) {
+        console.error(LOG_PREFIX, error);
+        toastr.error(String(error?.message || error), 'Failed Vector Purger');
+    }
+}
+
+async function onRepairClick() {
+    try {
+        await scanAndRepair({ mode: 'repair' });
     } catch (error) {
         console.error(LOG_PREFIX, error);
         toastr.error(String(error?.message || error), 'Failed Vector Purger');
@@ -993,6 +1119,9 @@ function getSettingsHtml() {
                     <div id="fvp_fill" class="menu_button menu_button_icon" title="削除せず、不足しているチャンクだけを標準機能と同じ単位で再試行しながら追加します">
                         <i class="fa-solid fa-puzzle-piece"></i><span>不足分を補完</span>
                     </div>
+                    <div id="fvp_repair" class="menu_button menu_button_icon" title="全ファイルの整合性を検査し、不足チャンクの追加・余剰と重複チャンクの削除を行って、標準機能で一度に作った状態と同じにします">
+                        <i class="fa-solid fa-screwdriver-wrench"></i><span>整合性チェックと修復</span>
+                    </div>
                     <div id="fvp_cancel" class="menu_button menu_button_icon" style="display:none" title="補完を中止します">
                         <i class="fa-solid fa-stop"></i><span>中止</span>
                     </div>
@@ -1055,7 +1184,7 @@ function registerSlashCommand() {
         name: 'vector-fill-missing',
         callback: async (args) => {
             const silent = String(args.quiet ?? 'false').toLowerCase() === 'true';
-            const { inserted } = await scanAndFill({ silent });
+            const { inserted } = await scanAndRepair({ mode: 'fill', silent });
             return String(inserted);
         },
         namedArgumentList: [
@@ -1068,6 +1197,25 @@ function registerSlashCommand() {
         ],
         helpString: '不完全・未ベクトル化のファイルについて、不足しているチャンクだけを標準機能と同じ単位で再試行しながら追加します。',
         returns: '追加したチャンク数',
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'vector-repair',
+        callback: async (args) => {
+            const silent = String(args.quiet ?? 'false').toLowerCase() === 'true';
+            const { ok } = await scanAndRepair({ mode: 'repair', silent });
+            return String(ok);
+        },
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({
+                name: 'quiet',
+                description: 'true の場合は完了通知を表示しない',
+                typeList: [ARGUMENT_TYPE.BOOLEAN],
+                defaultValue: 'false',
+            }),
+        ],
+        helpString: '全ファイルのベクトルの整合性を検査し、不足チャンクの追加と余剰・重複チャンクの削除を行います。',
+        returns: '修復後にすべて完全なら true、そうでなければ false',
     }));
 }
 
@@ -1089,6 +1237,7 @@ jQuery(async () => {
     $('#fvp_scan_purge').on('click', onScanAndPurgeClick);
     $('#fvp_revectorize').on('click', () => triggerRevectorize());
     $('#fvp_fill').on('click', onFillClick);
+    $('#fvp_repair').on('click', onRepairClick);
     $('#fvp_cancel').on('click', () => {
         cancelRequested = true;
     });
