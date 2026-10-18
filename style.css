@@ -64,3 +64,10 @@
     opacity: 0.7;
     font-style: italic;
 }
+
+.fvp_needs_vectorize .fvp_badge { background-color: rgba(220, 110, 60, 0.55); }
+
+.fvp_summary {
+    margin-top: 8px;
+    font-size: 0.9em;
+}

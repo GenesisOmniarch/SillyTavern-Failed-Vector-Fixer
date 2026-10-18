@@ -34,7 +34,8 @@ const defaultSettings = {
  * - complete: すべてのチャンクが保存されている
  * - incomplete: 保存済みチャンクが期待値の部分集合で、不足がある（＝ベクトル化失敗）
  * - mismatch: 期待しないチャンクが含まれている（チャンク設定変更・翻訳などで照合不能）
- * - empty: 未ベクトル化（標準機能が自動で処理するので対象外）
+ * - empty: コレクションが空（失敗して 1 チャンクも保存されなかった or 未処理）。
+ *   削除は不要だが再ベクトル化が必要なので、要ベクトル化として集計する
  * - error: 判定できなかった
  */
 const STATUS = Object.freeze({
@@ -62,6 +63,7 @@ const STATUS_LABELS = {
  * @property {string} status 判定結果
  * @property {number} saved 保存済みのユニークチャンク数
  * @property {number} expected 期待されるユニークチャンク数（最も近い候補）
+ * @property {boolean} disabled 無効化された Data Bank ファイルか（標準の Vectorize All は処理しない）
  * @property {string} [message] 補足
  */
 
@@ -255,7 +257,7 @@ function collectTargets(vs) {
             return;
         }
 
-        const entry = targets.get(file.url) ?? { url: file.url, name: file.name || file.url, origins: new Set(), file, variants: [] };
+        const entry = targets.get(file.url) ?? { url: file.url, name: file.name || file.url, origins: new Set(), file, variants: [], disabled: false };
         entry.origins.add(origin);
 
         for (const variant of variants) {
@@ -269,11 +271,16 @@ function collectTargets(vs) {
 
     // Data Bank: ingestDataBankAttachments / Vectorize All と同じ規則
     const thresholdDb = Number(vs.size_threshold_db) * 1024;
+    const enabledUrls = new Set(getDataBankAttachments(false).map(x => x.url));
     for (const file of getDataBankAttachments(settings.include_disabled)) {
+        const isNew = !targets.has(file.url);
         add(file, 'Data Bank', [{
             chunkSize: file.size > thresholdDb ? Number(vs.chunk_size_db) : -1,
             overlap: Number(vs.overlap_percent_db),
         }]);
+        if (isNew && !enabledUrls.has(file.url)) {
+            targets.get(file.url).disabled = true;
+        }
     }
 
     // チャット添付: processFiles は常に chunk_size、Vectorize All はしきい値で分岐するので両方を候補にする
@@ -285,6 +292,10 @@ function collectTargets(vs) {
         }
 
         for (const file of message.extra.files) {
+            // チャット添付は無効化の概念がなく、Vectorize All の対象になる
+            if (targets.has(file.url)) {
+                targets.get(file.url).disabled = false;
+            }
             add(file, 'Chat', [
                 { chunkSize: Number(vs.chunk_size), overlap: Number(vs.overlap_percent) },
                 { chunkSize: file.size > threshold ? Number(vs.chunk_size) : -1, overlap: Number(vs.overlap_percent) },
@@ -309,6 +320,7 @@ async function inspectTarget(target, vs, listBody) {
         status: STATUS.ERROR,
         saved: 0,
         expected: 0,
+        disabled: target.disabled,
     };
 
     try {
@@ -317,6 +329,9 @@ async function inspectTarget(target, vs, listBody) {
 
         if (savedSet.size === 0) {
             result.status = STATUS.EMPTY;
+            result.message = result.disabled
+                ? '無効化中のため標準機能は処理しません'
+                : '要ベクトル化（失敗して 1 チャンクも保存されていないか、未処理です）';
             return result;
         }
 
@@ -374,6 +389,23 @@ async function inspectTarget(target, vs, listBody) {
     return result;
 }
 
+/**
+ * 再ベクトル化が必要か（空のコレクション。削除済みのものも含む）。
+ */
+function needsVectorize(result) {
+    return result.status === STATUS.EMPTY && !result.disabled;
+}
+
+/**
+ * 検査結果の件数を集計して表示用の文字列にする。
+ * @param {ScanResult[]} results
+ */
+function summarize(results) {
+    const count = status => results.filter(r => r.status === status).length;
+    return `完了 ${count(STATUS.COMPLETE)} / 不完全 ${count(STATUS.INCOMPLETE)} / 未ベクトル化 ${results.filter(needsVectorize).length}`
+        + ` / 設定不一致 ${count(STATUS.MISMATCH)} / エラー ${count(STATUS.ERROR)}`;
+}
+
 function isPurgeTarget(result) {
     const settings = getSettings();
     return result.status === STATUS.INCOMPLETE || (settings.purge_mismatch && result.status === STATUS.MISMATCH);
@@ -415,7 +447,7 @@ async function purge(results) {
             console.log(LOG_PREFIX, `Purged ${result.collectionId} (${result.name})`);
             result.status = STATUS.EMPTY;
             result.saved = 0;
-            result.message = '削除済み（再ベクトル化待ち）';
+            result.message = '削除済み（要ベクトル化）';
             count++;
         } catch (error) {
             console.error(LOG_PREFIX, `Failed to purge ${result.collectionId}`, error);
@@ -444,7 +476,7 @@ function triggerRevectorize() {
 /**
  * 検査して不完全なものを削除する一連の処理。
  * @param {{dryRun?: boolean, silent?: boolean, revectorize?: boolean}} options
- * @returns {Promise<{scanned: number, purged: number, targets: number}>}
+ * @returns {Promise<{scanned: number, purged: number, targets: number, pending: number}>}
  */
 async function scanAndPurge({ dryRun = false, silent = false, revectorize = getSettings().auto_revectorize } = {}) {
     if (busy) {
@@ -469,21 +501,27 @@ async function scanAndPurge({ dryRun = false, silent = false, revectorize = getS
 
         renderResults();
 
+        // 削除したものに加え、最初から空のもの（1 バッチ目で失敗したもの）も再ベクトル化が必要
+        const pending = results.filter(needsVectorize).length;
+        const willRevectorize = !dryRun && pending > 0 && revectorize;
+
         if (!silent) {
-            if (!targets.length) {
-                toastr.success(`${results.length} 件を検査しました。不完全なベクトルはありません。`, 'Failed Vector Purger');
+            const summary = summarize(results);
+            if (!targets.length && !pending) {
+                toastr.success(`すべてのファイルのベクトル化が完了しています。<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
             } else if (dryRun) {
-                toastr.info(`${targets.length} 件の不完全なベクトルが見つかりました。`, 'Failed Vector Purger');
+                toastr.warning(`削除候補 ${targets.length} 件 / 要ベクトル化 ${pending} 件<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
             } else {
-                toastr.success(`${purged} / ${targets.length} 件の不完全なベクトルを削除しました。`, 'Failed Vector Purger');
+                const next = willRevectorize ? '再ベクトル化を開始します。' : '「再ベクトル化」を実行してください。';
+                toastr.warning(`${purged} 件を削除しました。要ベクトル化 ${pending} 件。${next}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
             }
         }
 
-        if (!dryRun && purged > 0 && revectorize) {
+        if (willRevectorize) {
             triggerRevectorize();
         }
 
-        return { scanned: results.length, targets: targets.length, purged };
+        return { scanned: results.length, targets: targets.length, purged, pending };
     } finally {
         busy = false;
         setBusyUi(false);
@@ -502,13 +540,14 @@ function setBusyUi(isBusy) {
 function renderResults() {
     const container = $('#fvp_results');
     container.empty();
+    $('#fvp_summary').text(lastResults.length ? summarize(lastResults) : '');
 
     if (!lastResults.length) {
         container.append('<div class="fvp_empty">検査対象のファイルはありません。</div>');
         return;
     }
 
-    const order = [STATUS.INCOMPLETE, STATUS.MISMATCH, STATUS.ERROR, STATUS.EMPTY, STATUS.COMPLETE];
+    const order = [STATUS.INCOMPLETE, STATUS.EMPTY, STATUS.MISMATCH, STATUS.ERROR, STATUS.COMPLETE];
     const sorted = [...lastResults].sort((a, b) => order.indexOf(a.status) - order.indexOf(b.status));
 
     for (const result of sorted) {
@@ -516,7 +555,7 @@ function renderResults() {
         const checked = isPurgeTarget(result) ? 'checked' : '';
         const progress = result.expected ? `${result.saved} / ${result.expected}` : `${result.saved}`;
         const row = $(`
-            <div class="fvp_row fvp_status_${result.status}">
+            <div class="fvp_row fvp_status_${result.status} ${needsVectorize(result) ? 'fvp_needs_vectorize' : ''}">
                 <input type="checkbox" class="fvp_select" ${selectable ? '' : 'disabled'} ${selectable ? checked : ''}>
                 <span class="fvp_badge">${STATUS_LABELS[result.status]}</span>
                 <span class="fvp_name" title="${escapeHtml(result.url)}">${escapeHtml(result.name)}</span>
@@ -537,21 +576,11 @@ function isVectorizationRunning() {
 }
 
 async function onScanClick() {
-    if (busy) return;
-    busy = true;
-    setBusyUi(true);
-
     try {
-        const results = await scan();
-        renderResults();
-        const count = results.filter(isPurgeTarget).length;
-        toastr.info(`${results.length} 件を検査、削除候補 ${count} 件`, 'Failed Vector Purger');
+        await scanAndPurge({ dryRun: true });
     } catch (error) {
         console.error(LOG_PREFIX, error);
         toastr.error(String(error?.message || error), 'Failed Vector Purger');
-    } finally {
-        busy = false;
-        setBusyUi(false);
     }
 }
 
@@ -580,7 +609,7 @@ async function onPurgeSelectedClick() {
         renderResults();
         toastr.success(`${purged} 件のコレクションを削除しました`, 'Failed Vector Purger');
 
-        if (purged > 0 && getSettings().auto_revectorize) {
+        if (lastResults.some(needsVectorize) && getSettings().auto_revectorize) {
             triggerRevectorize();
         }
     } catch (error) {
@@ -607,9 +636,9 @@ async function onChatChanged() {
     }
 
     try {
-        const { purged } = await scanAndPurge({ silent: true });
-        if (purged > 0) {
-            toastr.info(`${purged} 件の不完全なベクトルを自動削除しました`, 'Failed Vector Purger');
+        const { purged, pending } = await scanAndPurge({ silent: true });
+        if (purged > 0 || pending > 0) {
+            toastr.info(`不完全なベクトル ${purged} 件を自動削除しました。要ベクトル化 ${pending} 件`, 'Failed Vector Purger');
         }
     } catch (error) {
         console.error(LOG_PREFIX, 'Auto purge failed', error);
@@ -660,6 +689,7 @@ function getSettingsHtml() {
                     </div>
                     <i id="fvp_spinner" class="fa-solid fa-spinner fa-spin" style="display:none"></i>
                 </div>
+                <div id="fvp_summary" class="fvp_summary"></div>
                 <div id="fvp_results" class="fvp_results"></div>
             </div>
         </div>
