@@ -50,6 +50,16 @@ https://github.com/GenesisOmniarch/SillyTavern-Failed-Vector-Purger
 - **選択を削除**: 一覧でチェックしたコレクションを削除します。
 - **検査して削除**: 検査を行い、削除対象をまとめて削除します。
 - **再ベクトル化**: 標準 Vector Storage の「Vectorize All（ファイル）」を実行します。
+- **不足分を補完**: 削除はせず、不完全・未ベクトル化のファイルについて **不足しているチャンクだけ** を 1 チャンクずつ追加します。失敗したチャンクは指数バックオフ（2 秒, 4 秒, 8 秒…）で再試行し、それでも失敗したものはファイル名・チャンク番号・文字数を一覧とブラウザのコンソールに表示します。途中で「中止」できます。
+
+### 補完モードについて
+
+標準機能は 5 チャンクずつまとめて送信し、1 回でも失敗するとそのファイルの処理を打ち切ります。
+埋め込み API がときどき失敗する環境では、大きなファイルほど「削除して最初からやり直し」ではいつまでも完了しません。
+補完モードは保存済みのチャンクを残したまま続きから進むため、失敗しても次回は残りだけを処理します。
+
+チャンクの分割方法・ハッシュ・送信先（`/api/vector/insert`）・リクエスト内容は標準機能と同じなので、標準機能で作ったものと同じデータになります。
+ただし「Translate files」有効時と WebLLM は非対応です。
 
 ### オプション
 
@@ -57,6 +67,7 @@ https://github.com/GenesisOmniarch/SillyTavern-Failed-Vector-Purger
 - **「設定不一致」も削除対象にする**（既定: OFF）— チャンク設定を変更して作り直したいとき用
 - **削除後に標準機能の「Vectorize All」を自動実行する**（既定: OFF）
 - **チャット切り替え時に自動で検査・削除する**（既定: OFF）
+- **補完時の再試行回数**（既定: 3）
 
 ### スラッシュコマンド
 
@@ -65,6 +76,7 @@ https://github.com/GenesisOmniarch/SillyTavern-Failed-Vector-Purger
 /vector-purge-failed dry=true        検査のみ（削除候補の件数を返す）
 /vector-purge-failed revectorize=true  削除後に標準の Vectorize All を実行
 /vector-purge-failed quiet=true      通知を出さない
+/vector-fill-missing                 不足チャンクだけを補完（追加したチャンク数を返す）
 ```
 
 ## 注意事項

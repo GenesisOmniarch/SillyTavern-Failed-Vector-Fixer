@@ -8,6 +8,9 @@
  * 「ベクトル化済み」と判断して再処理しないため、途中で失敗したファイルは
  * 不完全なまま放置される。本拡張機能はそれらを空に戻すことで、
  * 標準機能の「Vectorize All」で不足分のファイルのみを再ベクトル化できるようにする。
+ *
+ * 失敗が繰り返される環境向けに、標準機能と同じチャンク・同じ API で
+ * 不足チャンクだけを 1 件ずつ再試行しながら追加する「補完」モードも持つ。
  */
 
 import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
@@ -15,6 +18,7 @@ import { extension_settings, getContext } from '../../../extensions.js';
 import { getStringHash, splitRecursive, trimToStartSentence, trimToEndSentence, escapeHtml } from '../../../utils.js';
 import { getDataBankAttachments, getFileAttachment } from '../../../chats.js';
 import { textgen_types, textgenerationwebui_settings } from '../../../textgen-settings.js';
+import { oai_settings } from '../../../openai.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
@@ -27,6 +31,7 @@ const defaultSettings = {
     purge_mismatch: false,
     auto_revectorize: false,
     auto_purge_on_chat_change: false,
+    fill_retries: 3,
 };
 
 /**
@@ -71,6 +76,7 @@ const STATUS_LABELS = {
 let lastResults = [];
 let busy = false;
 let koboldModelCache = null;
+let cancelRequested = false;
 
 function getSettings() {
     extension_settings[MODULE_NAME] = Object.assign({}, defaultSettings, extension_settings[MODULE_NAME]);
@@ -232,6 +238,14 @@ function overlapChunks(chunk, index, chunks, overlapSize) {
  * @returns {Set<number>}
  */
 function computeExpectedHashes(fileText, chunkSize, overlapPercent, vs) {
+    return new Set(computeChunkItems(fileText, chunkSize, overlapPercent, vs).map(item => item.hash));
+}
+
+/**
+ * 標準機能の vectorizeFile と同じ手順でチャンクを作る。
+ * @returns {{hash: number, text: string, index: number}[]}
+ */
+function computeChunkItems(fileText, chunkSize, overlapPercent, vs) {
     const overlapSize = Math.round(chunkSize * overlapPercent / 100);
     const delimiters = getChunkDelimiters(vs);
     chunkSize = overlapSize > 0 ? (chunkSize - overlapSize) : chunkSize;
@@ -240,7 +254,7 @@ function computeExpectedHashes(fileText, chunkSize, overlapPercent, vs) {
         ? fileText.split(vs.force_chunk_delimiter).map(applyOverlap)
         : splitRecursive(fileText, chunkSize, delimiters).map(applyOverlap);
 
-    return new Set(chunks.map(chunk => getStringHash(chunk)));
+    return chunks.map((chunk, index) => ({ hash: getStringHash(chunk), text: chunk, index }));
 }
 
 /**
@@ -277,6 +291,7 @@ function collectTargets(vs) {
         add(file, 'Data Bank', [{
             chunkSize: file.size > thresholdDb ? Number(vs.chunk_size_db) : -1,
             overlap: Number(vs.overlap_percent_db),
+            preferred: true,
         }]);
         if (isNew && !enabledUrls.has(file.url)) {
             targets.get(file.url).disabled = true;
@@ -298,7 +313,8 @@ function collectTargets(vs) {
             }
             add(file, 'Chat', [
                 { chunkSize: Number(vs.chunk_size), overlap: Number(vs.overlap_percent) },
-                { chunkSize: file.size > threshold ? Number(vs.chunk_size) : -1, overlap: Number(vs.overlap_percent) },
+                // Vectorize All と同じ規則。空のコレクションを補完するときはこちらを使う
+                { chunkSize: file.size > threshold ? Number(vs.chunk_size) : -1, overlap: Number(vs.overlap_percent), preferred: true },
             ]);
         }
     }
@@ -323,9 +339,13 @@ async function inspectTarget(target, vs, listBody) {
         disabled: target.disabled,
     };
 
+    // 補完モード用の情報（表示には使わない）
+    Object.defineProperty(result, 'plan', { value: { target, savedSet: new Set(), text: null, variant: null }, enumerable: false });
+
     try {
         const savedSet = new Set(await getSavedHashes(collectionId, listBody));
         result.saved = savedSet.size;
+        result.plan.savedSet = savedSet;
 
         if (savedSet.size === 0) {
             result.status = STATUS.EMPTY;
@@ -356,7 +376,7 @@ async function inspectTarget(target, vs, listBody) {
                 const expected = computeExpectedHashes(text, variant.chunkSize, variant.overlap, vs);
                 const missing = [...expected].filter(h => !savedSet.has(h)).length;
                 const extra = [...savedSet].filter(h => !expected.has(h)).length;
-                const candidate = { expected: expected.size, missing, extra };
+                const candidate = { expected: expected.size, missing, extra, text, variant };
 
                 if (!best || extra < best.extra || (extra === best.extra && missing < best.missing)) {
                     best = candidate;
@@ -365,6 +385,8 @@ async function inspectTarget(target, vs, listBody) {
         }
 
         result.expected = best.expected;
+        result.plan.text = best.text;
+        result.plan.variant = best.variant;
 
         if (best.missing === 0 && best.extra === 0) {
             result.status = STATUS.COMPLETE;
@@ -473,6 +495,241 @@ function triggerRevectorize() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 補完モード: 不足チャンクだけを 1 件ずつ再試行しながら追加する
+// ---------------------------------------------------------------------------
+
+/**
+ * 標準機能の getVectorsRequestBody と同じ内容で insert 用のリクエストボディを作る。
+ * @param {object} vs
+ * @param {string[]} texts 埋め込み対象（KoboldCpp ではクライアント側で埋め込みを作る）
+ * @returns {Promise<object>}
+ */
+async function getInsertRequestBody(vs, texts) {
+    const body = await getListRequestBody(vs);
+    const serverUrl = type => vs.use_alt_endpoint ? vs.alt_endpoint_url : textgenerationwebui_settings.server_urls[type];
+
+    switch (vs.source) {
+        case 'extras':
+            body.extrasUrl = extension_settings.apiUrl;
+            body.extrasKey = extension_settings.apiKey;
+            break;
+        case 'ollama':
+            body.apiUrl = serverUrl(textgen_types.OLLAMA);
+            body.keep = !!vs.ollama_keep;
+            break;
+        case 'llamacpp':
+            body.apiUrl = serverUrl(textgen_types.LLAMACPP);
+            break;
+        case 'vllm':
+            body.apiUrl = serverUrl(textgen_types.VLLM);
+            break;
+        case 'vertexai':
+            body.vertexai_auth_mode = oai_settings.vertexai_auth_mode;
+            body.vertexai_region = oai_settings.vertexai_region;
+            body.vertexai_express_project_id = oai_settings.vertexai_express_project_id;
+            break;
+        case 'siliconflow':
+            body.siliconflow_endpoint = oai_settings.siliconflow_endpoint;
+            break;
+        case 'workers_ai':
+            body.workers_ai_account_id = oai_settings.workers_ai_account_id;
+            break;
+        case 'koboldcpp': {
+            const response = await fetch('/api/backends/kobold/embed', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify({ items: texts, server: serverUrl(textgen_types.KOBOLDCPP) }),
+            });
+            if (!response.ok) {
+                throw new Error('KoboldCpp の埋め込み取得に失敗しました');
+            }
+            const data = await response.json();
+            if (!Array.isArray(data.embeddings) || data.embeddings.length !== texts.length || data.embeddings.some(e => !Array.isArray(e) || !e.length)) {
+                throw new Error('KoboldCpp から不正な埋め込みが返されました');
+            }
+            body.model = data.model;
+            body.embeddings = Object.fromEntries(texts.map((t, i) => [t, data.embeddings[i]]));
+            break;
+        }
+    }
+
+    return body;
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * 1 チャンクを挿入する。失敗したら指数バックオフで再試行する。
+ * @returns {Promise<string|null>} 最後のエラー内容（成功時は null）
+ */
+async function insertWithRetry(collectionId, item, vs, retries) {
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        if (cancelRequested) {
+            return '中止されました';
+        }
+
+        if (attempt > 0) {
+            await sleep(2000 * 2 ** (attempt - 1));
+        }
+
+        try {
+            const body = await getInsertRequestBody(vs, [item.text]);
+            const response = await fetch('/api/vector/insert', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify({ ...body, collectionId, items: [item] }),
+            });
+
+            if (response.ok) {
+                return null;
+            }
+
+            lastError = `HTTP ${response.status}`;
+        } catch (error) {
+            lastError = String(error?.message || error);
+        }
+
+        console.warn(LOG_PREFIX, `Insert failed for ${collectionId} chunk #${item.index} (attempt ${attempt + 1}/${retries + 1}): ${lastError}`);
+    }
+
+    return lastError;
+}
+
+/**
+ * 1 ファイル分の不足チャンクを補完する。
+ * @param {ScanResult} result
+ * @param {object} vs
+ * @param {(done: number, total: number) => void} onProgress
+ * @returns {Promise<{inserted: number, failed: {index: number, length: number, error: string}[]}>}
+ */
+async function fillMissing(result, vs, onProgress) {
+    if (vs.translate_files) {
+        throw new Error('Vector Storage の「Translate files」が有効なため補完できません');
+    }
+
+    if (vs.source === 'webllm') {
+        throw new Error('WebLLM は補完モードに対応していません');
+    }
+
+    const plan = result.plan;
+    let { text, variant } = plan;
+
+    if (!text || !variant) {
+        // 空のコレクション: 標準の Vectorize All と同じ規則でチャンクを作る
+        text = (typeof plan.target.file.text === 'string' && plan.target.file.text) || await getFileAttachment(plan.target.url);
+        variant = plan.target.variants.find(v => v.preferred) ?? plan.target.variants[0];
+    }
+
+    if (!text) {
+        throw new Error('ファイル本文を取得できませんでした');
+    }
+
+    const items = computeChunkItems(text, variant.chunkSize, variant.overlap, vs).filter(item => !plan.savedSet.has(item.hash));
+    const retries = Math.max(0, Number(getSettings().fill_retries) || 0);
+    const failed = [];
+    let inserted = 0;
+
+    for (let i = 0; i < items.length; i++) {
+        if (cancelRequested) {
+            break;
+        }
+
+        onProgress(i, items.length);
+        const error = await insertWithRetry(result.collectionId, items[i], vs, retries);
+
+        if (error) {
+            failed.push({ index: items[i].index, length: items[i].text.length, error });
+            console.error(LOG_PREFIX, `Chunk #${items[i].index} of ${result.name} (${items[i].text.length} chars) failed: ${error}`, items[i].text);
+        } else {
+            inserted++;
+            plan.savedSet.add(items[i].hash);
+        }
+    }
+
+    onProgress(items.length, items.length);
+    return { inserted, failed };
+}
+
+/**
+ * 検査して、不完全・未ベクトル化のファイルを補完する。
+ * @returns {Promise<{files: number, inserted: number, failed: number}>}
+ */
+async function scanAndFill({ silent = false } = {}) {
+    if (busy) {
+        throw new Error('処理中です');
+    }
+
+    if (isVectorizationRunning()) {
+        throw new Error('標準 Vector Storage がファイルを取り込み中です。完了してから実行してください。');
+    }
+
+    busy = true;
+    cancelRequested = false;
+    setBusyUi(true);
+    $('#fvp_cancel').show();
+
+    const toastBody = $('<span>').text('検査中...');
+    const toast = toastr.info(toastBody, '不足チャンクを補完中', { timeOut: 0, extendedTimeOut: 0, closeButton: false, escapeHtml: false });
+    let inserted = 0;
+    let failed = 0;
+    let files = 0;
+
+    try {
+        const vs = getVectorSettings();
+        const results = await scan();
+        const targets = results.filter(r => r.status === STATUS.INCOMPLETE || needsVectorize(r));
+
+        for (let i = 0; i < targets.length && !cancelRequested; i++) {
+            const result = targets[i];
+            files++;
+
+            try {
+                const outcome = await fillMissing(result, vs, (done, total) => {
+                    toastBody.text(`ファイル ${i + 1}/${targets.length}: ${result.name} — ${done}/${total} チャンク`);
+                });
+                inserted += outcome.inserted;
+                failed += outcome.failed.length;
+
+                if (outcome.failed.length) {
+                    const list = outcome.failed.slice(0, 5).map(f => `#${f.index}（${f.length} 文字）: ${f.error}`).join(' / ');
+                    result.message = `${outcome.failed.length} チャンクが再試行後も失敗: ${list}`;
+                }
+            } catch (error) {
+                failed++;
+                result.message = String(error?.message || error);
+                console.error(LOG_PREFIX, `Fill failed for ${result.name}`, error);
+            }
+        }
+
+        // 結果を検査し直して表示する（失敗メッセージは引き継ぐ）
+        const messages = new Map(results.filter(r => r.message).map(r => [r.collectionId, r.message]));
+        const rescanned = await scan();
+        for (const r of rescanned) {
+            if (r.status !== STATUS.COMPLETE && messages.has(r.collectionId)) {
+                r.message = messages.get(r.collectionId);
+            }
+        }
+        renderResults();
+
+        if (!silent) {
+            const summary = summarize(rescanned);
+            const head = cancelRequested ? '中止しました。' : '補完が終わりました。';
+            const type = failed || cancelRequested ? 'warning' : 'success';
+            toastr[type](`${head}追加 ${inserted} チャンク / 失敗 ${failed}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false, timeOut: 10000 });
+        }
+
+        return { files, inserted, failed };
+    } finally {
+        toastr.clear(toast);
+        busy = false;
+        setBusyUi(false);
+        $('#fvp_cancel').hide();
+    }
+}
+
 /**
  * 検査して不完全なものを削除する一連の処理。
  * @param {{dryRun?: boolean, silent?: boolean, revectorize?: boolean}} options
@@ -533,7 +790,7 @@ async function scanAndPurge({ dryRun = false, silent = false, revectorize = getS
 // ---------------------------------------------------------------------------
 
 function setBusyUi(isBusy) {
-    $('#fvp_container .menu_button').toggleClass('disabled', isBusy);
+    $('#fvp_container .menu_button').not('#fvp_cancel').toggleClass('disabled', isBusy);
     $('#fvp_spinner').toggle(isBusy);
 }
 
@@ -630,6 +887,15 @@ async function onScanAndPurgeClick() {
     }
 }
 
+async function onFillClick() {
+    try {
+        await scanAndFill();
+    } catch (error) {
+        console.error(LOG_PREFIX, error);
+        toastr.error(String(error?.message || error), 'Failed Vector Purger');
+    }
+}
+
 async function onChatChanged() {
     if (!getSettings().auto_purge_on_chat_change || busy || isVectorizationRunning()) {
         return;
@@ -674,6 +940,10 @@ function getSettingsHtml() {
                     <input type="checkbox" id="fvp_auto_purge_on_chat_change">
                     <span>チャット切り替え時に自動で検査・削除する</span>
                 </label>
+                <label for="fvp_fill_retries">
+                    <small>補完時の再試行回数（1 チャンクあたり）</small>
+                    <input type="number" id="fvp_fill_retries" class="text_pole" min="0" max="10" step="1">
+                </label>
                 <div class="flex-container">
                     <div id="fvp_scan" class="menu_button menu_button_icon" title="削除せずに検査だけ行います">
                         <i class="fa-solid fa-magnifying-glass"></i><span>検査</span>
@@ -686,6 +956,12 @@ function getSettingsHtml() {
                     </div>
                     <div id="fvp_revectorize" class="menu_button menu_button_icon" title="標準 Vector Storage の Vectorize All（ファイル）を実行します">
                         <i class="fa-solid fa-rotate"></i><span>再ベクトル化</span>
+                    </div>
+                    <div id="fvp_fill" class="menu_button menu_button_icon" title="削除せず、不足しているチャンクだけを 1 件ずつ再試行しながら追加します">
+                        <i class="fa-solid fa-puzzle-piece"></i><span>不足分を補完</span>
+                    </div>
+                    <div id="fvp_cancel" class="menu_button menu_button_icon" style="display:none" title="補完を中止します">
+                        <i class="fa-solid fa-stop"></i><span>中止</span>
                     </div>
                     <i id="fvp_spinner" class="fa-solid fa-spinner fa-spin" style="display:none"></i>
                 </div>
@@ -741,6 +1017,25 @@ function registerSlashCommand() {
         helpString: 'ベクトル化が完了しなかったファイルのベクトルコレクションを削除し、削除件数を返します。',
         returns: '削除した件数（dry=true の場合は削除候補の件数）',
     }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'vector-fill-missing',
+        callback: async (args) => {
+            const silent = String(args.quiet ?? 'false').toLowerCase() === 'true';
+            const { inserted } = await scanAndFill({ silent });
+            return String(inserted);
+        },
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({
+                name: 'quiet',
+                description: 'true の場合は完了通知を表示しない',
+                typeList: [ARGUMENT_TYPE.BOOLEAN],
+                defaultValue: 'false',
+            }),
+        ],
+        helpString: '不完全・未ベクトル化のファイルについて、不足しているチャンクだけを 1 件ずつ再試行しながら追加します。',
+        returns: '追加したチャンク数',
+    }));
 }
 
 jQuery(async () => {
@@ -759,6 +1054,14 @@ jQuery(async () => {
     $('#fvp_purge_selected').on('click', onPurgeSelectedClick);
     $('#fvp_scan_purge').on('click', onScanAndPurgeClick);
     $('#fvp_revectorize').on('click', () => triggerRevectorize());
+    $('#fvp_fill').on('click', onFillClick);
+    $('#fvp_cancel').on('click', () => {
+        cancelRequested = true;
+    });
+    $('#fvp_fill_retries').val(getSettings().fill_retries).on('input', function () {
+        getSettings().fill_retries = Math.max(0, Math.min(10, Number($(this).val()) || 0));
+        saveSettingsDebounced();
+    });
 
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
 
