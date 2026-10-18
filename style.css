@@ -1,0 +1,66 @@
+.fvp_container .fvp_desc {
+    display: block;
+    margin-bottom: 6px;
+    opacity: 0.8;
+}
+
+.fvp_container .flex-container {
+    align-items: center;
+    margin-top: 6px;
+}
+
+.fvp_results {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.fvp_row {
+    display: grid;
+    grid-template-columns: auto auto 1fr auto auto;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+}
+
+.fvp_row .fvp_name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fvp_row .fvp_origin,
+.fvp_row .fvp_progress {
+    font-size: 0.85em;
+    opacity: 0.75;
+    white-space: nowrap;
+}
+
+.fvp_row .fvp_message {
+    grid-column: 2 / -1;
+    font-size: 0.85em;
+    opacity: 0.8;
+}
+
+.fvp_badge {
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 0.8em;
+    white-space: nowrap;
+    background-color: var(--black30a);
+}
+
+.fvp_status_incomplete .fvp_badge { background-color: rgba(220, 70, 70, 0.55); }
+.fvp_status_mismatch .fvp_badge { background-color: rgba(220, 160, 40, 0.55); }
+.fvp_status_error .fvp_badge { background-color: rgba(150, 80, 200, 0.55); }
+.fvp_status_complete .fvp_badge { background-color: rgba(60, 170, 90, 0.55); }
+
+.fvp_empty {
+    opacity: 0.7;
+    font-style: italic;
+}
