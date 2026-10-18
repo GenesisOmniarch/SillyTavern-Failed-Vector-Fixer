@@ -9,8 +9,8 @@
  * 不完全なまま放置される。本拡張機能はそれらを空に戻すことで、
  * 標準機能の「Vectorize All」で不足分のファイルのみを再ベクトル化できるようにする。
  *
- * 失敗が繰り返される環境向けに、標準機能と同じチャンク・同じ API で
- * 不足チャンクだけを 1 件ずつ再試行しながら追加する「補完」モードも持つ。
+ * 失敗が繰り返される環境向けに、標準機能と同じチャンク・同じバッチ・同じ API で
+ * 不足チャンクだけを再試行しながら追加する「補完」モードも持つ。
  */
 
 import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
@@ -25,7 +25,7 @@ import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../slash-command
 
 const MODULE_NAME = 'failed_vector_purger';
 const LOG_PREFIX = 'Failed Vector Purger:';
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 
 const defaultSettings = {
     include_disabled: true,
@@ -497,7 +497,7 @@ function triggerRevectorize() {
 }
 
 // ---------------------------------------------------------------------------
-// 補完モード: 不足チャンクだけを 1 件ずつ再試行しながら追加する
+// 補完モード: 不足チャンクだけを 標準機能と同じバッチ単位で再試行しながら追加する
 // ---------------------------------------------------------------------------
 
 /**
@@ -561,42 +561,69 @@ async function getInsertRequestBody(vs, texts) {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * 1 チャンクを挿入する。失敗したら指数バックオフで再試行する。
- * @returns {Promise<string|null>} 最後のエラー内容（成功時は null）
+ * 標準機能と同じバッチサイズ（transformers / ollama は 1、それ以外は 5）。
  */
-async function insertWithRetry(collectionId, item, vs, retries) {
+function getBatchSize(vs) {
+    return ['transformers', 'ollama'].includes(vs.source) ? 1 : 5;
+}
+
+/**
+ * チャンクをまとめて 1 リクエストで挿入する。
+ * @returns {Promise<string|null>} エラー内容（成功時は null）
+ */
+async function insertOnce(collectionId, items, vs) {
+    try {
+        const body = await getInsertRequestBody(vs, items.map(x => x.text));
+        const response = await fetch('/api/vector/insert', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ ...body, collectionId, items }),
+        });
+
+        return response.ok ? null : `HTTP ${response.status}`;
+    } catch (error) {
+        return String(error?.message || error);
+    }
+}
+
+/**
+ * 1 バッチを挿入する。失敗したら指数バックオフで再試行し、それでも失敗したら
+ * どのチャンクが原因かを特定するために 1 チャンクずつ送り直す。
+ * @returns {Promise<{item: object, error: string}[]>} 失敗したチャンク
+ */
+async function insertBatchWithRetry(collectionId, batch, vs, retries) {
     let lastError = null;
 
     for (let attempt = 0; attempt <= retries; attempt++) {
         if (cancelRequested) {
-            return '中止されました';
+            return batch.map(item => ({ item, error: '中止されました' }));
         }
 
         if (attempt > 0) {
             await sleep(2000 * 2 ** (attempt - 1));
         }
 
-        try {
-            const body = await getInsertRequestBody(vs, [item.text]);
-            const response = await fetch('/api/vector/insert', {
-                method: 'POST',
-                headers: getRequestHeaders(),
-                body: JSON.stringify({ ...body, collectionId, items: [item] }),
-            });
-
-            if (response.ok) {
-                return null;
-            }
-
-            lastError = `HTTP ${response.status}`;
-        } catch (error) {
-            lastError = String(error?.message || error);
+        lastError = await insertOnce(collectionId, batch, vs);
+        if (!lastError) {
+            return [];
         }
 
-        console.warn(LOG_PREFIX, `Insert failed for ${collectionId} chunk #${item.index} (attempt ${attempt + 1}/${retries + 1}): ${lastError}`);
+        console.warn(LOG_PREFIX, `Insert failed for ${collectionId} chunks #${batch[0].index}-#${batch[batch.length - 1].index} (attempt ${attempt + 1}/${retries + 1}): ${lastError}`);
     }
 
-    return lastError;
+    if (batch.length === 1) {
+        return [{ item: batch[0], error: lastError }];
+    }
+
+    const failed = [];
+    for (const item of batch) {
+        const error = await insertOnce(collectionId, [item], vs);
+        if (error) {
+            failed.push({ item, error });
+        }
+    }
+
+    return failed;
 }
 
 /**
@@ -630,23 +657,28 @@ async function fillMissing(result, vs, onProgress) {
 
     const items = computeChunkItems(text, variant.chunkSize, variant.overlap, vs).filter(item => !plan.savedSet.has(item.hash));
     const retries = Math.max(0, Number(getSettings().fill_retries) || 0);
+    const batchSize = getBatchSize(vs);
     const failed = [];
     let inserted = 0;
 
-    for (let i = 0; i < items.length; i++) {
+    for (let i = 0; i < items.length; i += batchSize) {
         if (cancelRequested) {
             break;
         }
 
         onProgress(i, items.length);
-        const error = await insertWithRetry(result.collectionId, items[i], vs, retries);
+        const batch = items.slice(i, i + batchSize);
+        const batchFailed = await insertBatchWithRetry(result.collectionId, batch, vs, retries);
 
-        if (error) {
-            failed.push({ index: items[i].index, length: items[i].text.length, error });
-            console.error(LOG_PREFIX, `Chunk #${items[i].index} of ${result.name} (${items[i].text.length} chars) failed: ${error}`, items[i].text);
-        } else {
-            inserted++;
-            plan.savedSet.add(items[i].hash);
+        for (const item of batch) {
+            const failure = batchFailed.find(f => f.item === item);
+            if (failure) {
+                failed.push({ index: item.index, length: item.text.length, error: failure.error });
+                console.error(LOG_PREFIX, `Chunk #${item.index} of ${result.name} (${item.text.length} chars) failed: ${failure.error}`, item.text);
+            } else {
+                inserted++;
+                plan.savedSet.add(item.hash);
+            }
         }
     }
 
@@ -958,7 +990,7 @@ function getSettingsHtml() {
                     <div id="fvp_revectorize" class="menu_button menu_button_icon" title="標準 Vector Storage の Vectorize All（ファイル）を実行します">
                         <i class="fa-solid fa-rotate"></i><span>再ベクトル化</span>
                     </div>
-                    <div id="fvp_fill" class="menu_button menu_button_icon" title="削除せず、不足しているチャンクだけを 1 件ずつ再試行しながら追加します">
+                    <div id="fvp_fill" class="menu_button menu_button_icon" title="削除せず、不足しているチャンクだけを標準機能と同じ単位で再試行しながら追加します">
                         <i class="fa-solid fa-puzzle-piece"></i><span>不足分を補完</span>
                     </div>
                     <div id="fvp_cancel" class="menu_button menu_button_icon" style="display:none" title="補完を中止します">
@@ -1034,7 +1066,7 @@ function registerSlashCommand() {
                 defaultValue: 'false',
             }),
         ],
-        helpString: '不完全・未ベクトル化のファイルについて、不足しているチャンクだけを 1 件ずつ再試行しながら追加します。',
+        helpString: '不完全・未ベクトル化のファイルについて、不足しているチャンクだけを標準機能と同じ単位で再試行しながら追加します。',
         returns: '追加したチャンク数',
     }));
 }
