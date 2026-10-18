@@ -25,6 +25,7 @@ import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../slash-command
 
 const MODULE_NAME = 'failed_vector_purger';
 const LOG_PREFIX = 'Failed Vector Purger:';
+const VERSION = '1.2.0';
 
 const defaultSettings = {
     include_disabled: true,
@@ -916,7 +917,7 @@ function getSettingsHtml() {
     <div id="fvp_container" class="fvp_container">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>Failed Vector Purger</b>
+                <b>Failed Vector Purger <small>v${VERSION}</small></b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
@@ -1040,6 +1041,7 @@ function registerSlashCommand() {
 
 jQuery(async () => {
     getSettings();
+    console.log(LOG_PREFIX, `v${VERSION} loaded`);
 
     const html = getSettingsHtml();
     const target = $('#extensions_settings2').length ? $('#extensions_settings2') : $('#extensions_settings');
