@@ -1,8 +1,8 @@
 /**
- * Failed Vector Purger
+ * Failed Vector Fixer
  *
  * 標準の Vector Storage 拡張機能でベクトル化が最後まで完了しなかったファイル
- * （Data Bank / チャット添付ファイル）のコレクションだけを検出して削除する。
+ * （Data Bank / チャット添付ファイル）を検出し、削除・補完・整合性修復で直す。
  *
  * 標準機能はファイルのコレクションに 1 件でもハッシュが存在すると
  * 「ベクトル化済み」と判断して再処理しないため、途中で失敗したファイルは
@@ -23,9 +23,12 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
 
-const MODULE_NAME = 'failed_vector_purger';
-const LOG_PREFIX = 'Failed Vector Purger:';
-const VERSION = '1.4.0';
+const MODULE_NAME = 'failed_vector_fixer';
+// 旧名（Failed Vector Purger）時代の設定キー。設定を引き継ぐために読む
+const LEGACY_MODULE_NAME = 'failed_vector_purger';
+const DISPLAY_NAME = 'Failed Vector Fixer';
+const LOG_PREFIX = `${DISPLAY_NAME}:`;
+const VERSION = '1.5.0';
 
 const defaultSettings = {
     include_disabled: true,
@@ -83,6 +86,11 @@ let koboldModelCache = null;
 let cancelRequested = false;
 
 function getSettings() {
+    if (!extension_settings[MODULE_NAME] && extension_settings[LEGACY_MODULE_NAME]) {
+        extension_settings[MODULE_NAME] = extension_settings[LEGACY_MODULE_NAME];
+        delete extension_settings[LEGACY_MODULE_NAME];
+    }
+
     extension_settings[MODULE_NAME] = Object.assign({}, defaultSettings, extension_settings[MODULE_NAME]);
     return extension_settings[MODULE_NAME];
 }
@@ -516,7 +524,7 @@ async function purge(results) {
 function triggerRevectorize() {
     const button = $('#vectors_files_vectorize_all');
     if (!button.length) {
-        toastr.warning('標準 Vector Storage の「Vectorize All」ボタンが見つかりません', 'Failed Vector Purger');
+        toastr.warning('標準 Vector Storage の「Vectorize All」ボタンが見つかりません', DISPLAY_NAME);
         return false;
     }
 
@@ -861,12 +869,12 @@ async function scanAndRepair({ mode = 'fill', silent = false } = {}) {
             const summary = summarize(rescanned);
             const counts = `追加 ${inserted} / 削除 ${deleted} / 失敗 ${failed} チャンク`;
             if (cancelRequested) {
-                toastr.warning(`中止しました。${counts}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false, timeOut: 10000 });
+                toastr.warning(`中止しました。${counts}<br>${summary}`, DISPLAY_NAME, { escapeHtml: false, timeOut: 10000 });
             } else if (ok) {
-                toastr.success(`整合性 OK：${checked.length} 件すべて完全です。${counts}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false, timeOut: 10000 });
+                toastr.success(`整合性 OK：${checked.length} 件すべて完全です。${counts}<br>${summary}`, DISPLAY_NAME, { escapeHtml: false, timeOut: 10000 });
             } else {
                 const ng = checked.filter(r => r.status !== STATUS.COMPLETE).length;
-                toastr.error(`整合性 NG：${ng} 件が完全ではありません。一覧を確認してください。${counts}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false, timeOut: 0, extendedTimeOut: 0, closeButton: true });
+                toastr.error(`整合性 NG：${ng} 件が完全ではありません。一覧を確認してください。${counts}<br>${summary}`, DISPLAY_NAME, { escapeHtml: false, timeOut: 0, extendedTimeOut: 0, closeButton: true });
             }
         }
 
@@ -915,12 +923,12 @@ async function scanAndPurge({ dryRun = false, silent = false, revectorize = getS
             const summary = summarize(results);
             const allComplete = results.every(r => r.status === STATUS.COMPLETE || (r.disabled && r.status === STATUS.EMPTY));
             if (allComplete) {
-                toastr.success(`すべてのファイルのベクトル化が完了しています。<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
+                toastr.success(`すべてのファイルのベクトル化が完了しています。<br>${summary}`, DISPLAY_NAME, { escapeHtml: false });
             } else if (dryRun || (!targets.length && !pending)) {
-                toastr.warning(`削除候補 ${targets.length} 件 / 要ベクトル化 ${pending} 件。要修復・エラーは一覧を確認してください。<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
+                toastr.warning(`削除候補 ${targets.length} 件 / 要ベクトル化 ${pending} 件。要修復・エラーは一覧を確認してください。<br>${summary}`, DISPLAY_NAME, { escapeHtml: false });
             } else {
-                const next = willRevectorize ? '再ベクトル化を開始します。' : '「再ベクトル化」を実行してください。';
-                toastr.warning(`${purged} 件を削除しました。要ベクトル化 ${pending} 件。${next}<br>${summary}`, 'Failed Vector Purger', { escapeHtml: false });
+                const next = willRevectorize ? '再ベクトル化を開始します。' : '標準 Vector Storage の「Vectorize All」を実行してください。';
+                toastr.warning(`${purged} 件を削除しました。要ベクトル化 ${pending} 件。${next}<br>${summary}`, DISPLAY_NAME, { escapeHtml: false });
             }
         }
 
@@ -987,7 +995,7 @@ async function onScanClick() {
         await scanAndPurge({ dryRun: true });
     } catch (error) {
         console.error(LOG_PREFIX, error);
-        toastr.error(String(error?.message || error), 'Failed Vector Purger');
+        toastr.error(String(error?.message || error), DISPLAY_NAME);
     }
 }
 
@@ -999,12 +1007,12 @@ async function onPurgeSelectedClick() {
     const selected = lastResults.filter(r => selectedIds.includes(r.collectionId));
 
     if (isVectorizationRunning()) {
-        toastr.warning('標準 Vector Storage がファイルを取り込み中です。完了してから実行してください。', 'Failed Vector Purger');
+        toastr.warning('標準 Vector Storage がファイルを取り込み中です。完了してから実行してください。', DISPLAY_NAME);
         return;
     }
 
     if (!selected.length) {
-        toastr.info('削除対象が選択されていません。先に「検査」を実行してください。', 'Failed Vector Purger');
+        toastr.info('削除対象が選択されていません。先に「検査」を実行してください。', DISPLAY_NAME);
         return;
     }
 
@@ -1014,26 +1022,17 @@ async function onPurgeSelectedClick() {
     try {
         const purged = await purge(selected);
         renderResults();
-        toastr.success(`${purged} 件のコレクションを削除しました`, 'Failed Vector Purger');
+        toastr.success(`${purged} 件のコレクションを削除しました`, DISPLAY_NAME);
 
         if (lastResults.some(needsVectorize) && getSettings().auto_revectorize) {
             triggerRevectorize();
         }
     } catch (error) {
         console.error(LOG_PREFIX, error);
-        toastr.error(String(error?.message || error), 'Failed Vector Purger');
+        toastr.error(String(error?.message || error), DISPLAY_NAME);
     } finally {
         busy = false;
         setBusyUi(false);
-    }
-}
-
-async function onScanAndPurgeClick() {
-    try {
-        await scanAndPurge();
-    } catch (error) {
-        console.error(LOG_PREFIX, error);
-        toastr.error(String(error?.message || error), 'Failed Vector Purger');
     }
 }
 
@@ -1042,7 +1041,7 @@ async function onFillClick() {
         await scanAndRepair({ mode: 'fill' });
     } catch (error) {
         console.error(LOG_PREFIX, error);
-        toastr.error(String(error?.message || error), 'Failed Vector Purger');
+        toastr.error(String(error?.message || error), DISPLAY_NAME);
     }
 }
 
@@ -1051,7 +1050,7 @@ async function onRepairClick() {
         await scanAndRepair({ mode: 'repair' });
     } catch (error) {
         console.error(LOG_PREFIX, error);
-        toastr.error(String(error?.message || error), 'Failed Vector Purger');
+        toastr.error(String(error?.message || error), DISPLAY_NAME);
     }
 }
 
@@ -1063,7 +1062,7 @@ async function onChatChanged() {
     try {
         const { purged, pending } = await scanAndPurge({ silent: true });
         if (purged > 0 || pending > 0) {
-            toastr.info(`不完全なベクトル ${purged} 件を自動削除しました。要ベクトル化 ${pending} 件`, 'Failed Vector Purger');
+            toastr.info(`不完全なベクトル ${purged} 件を自動削除しました。要ベクトル化 ${pending} 件`, DISPLAY_NAME);
         }
     } catch (error) {
         console.error(LOG_PREFIX, 'Auto purge failed', error);
@@ -1075,7 +1074,7 @@ function getSettingsHtml() {
     <div id="fvp_container" class="fvp_container">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>Failed Vector Purger <small>v${VERSION}</small></b>
+                <b>${DISPLAY_NAME} <small>v${VERSION}</small></b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
@@ -1110,17 +1109,11 @@ function getSettingsHtml() {
                     <div id="fvp_purge_selected" class="menu_button menu_button_icon" title="チェックしたコレクションを削除します">
                         <i class="fa-solid fa-trash"></i><span>選択を削除</span>
                     </div>
-                    <div id="fvp_scan_purge" class="menu_button menu_button_icon" title="検査して不完全なものをすべて削除します">
-                        <i class="fa-solid fa-broom"></i><span>検査して削除</span>
-                    </div>
-                    <div id="fvp_revectorize" class="menu_button menu_button_icon" title="標準 Vector Storage の Vectorize All（ファイル）を実行します">
-                        <i class="fa-solid fa-rotate"></i><span>再ベクトル化</span>
-                    </div>
                     <div id="fvp_fill" class="menu_button menu_button_icon" title="削除せず、不足しているチャンクだけを標準機能と同じ単位で再試行しながら追加します">
                         <i class="fa-solid fa-puzzle-piece"></i><span>不足分を補完</span>
                     </div>
-                    <div id="fvp_repair" class="menu_button menu_button_icon" title="全ファイルの整合性を検査し、不足チャンクの追加・余剰と重複チャンクの削除を行って、標準機能で一度に作った状態と同じにします">
-                        <i class="fa-solid fa-screwdriver-wrench"></i><span>整合性チェックと修復</span>
+                    <div id="fvp_repair" class="menu_button menu_button_icon" title="全ファイルの整合性を検査して修復します（不足チャンクの追加・余剰と重複チャンクの削除）。標準機能で一度に作った状態と同じにします">
+                        <i class="fa-solid fa-screwdriver-wrench"></i><span>整合性チェック</span>
                     </div>
                     <div id="fvp_cancel" class="menu_button menu_button_icon" style="display:none" title="補完を中止します">
                         <i class="fa-solid fa-stop"></i><span>中止</span>
@@ -1234,8 +1227,6 @@ jQuery(async () => {
 
     $('#fvp_scan').on('click', onScanClick);
     $('#fvp_purge_selected').on('click', onPurgeSelectedClick);
-    $('#fvp_scan_purge').on('click', onScanAndPurgeClick);
-    $('#fvp_revectorize').on('click', () => triggerRevectorize());
     $('#fvp_fill').on('click', onFillClick);
     $('#fvp_repair').on('click', onRepairClick);
     $('#fvp_cancel').on('click', () => {

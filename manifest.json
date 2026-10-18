@@ -1,12 +1,12 @@
 {
-    "display_name": "Failed Vector Purger",
+    "display_name": "Failed Vector Fixer",
     "loading_order": 110,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
     "author": "GenesisOmniarch",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "homePage": "https://github.com/GenesisOmniarch/SillyTavern-Failed-Vector-Purger",
     "auto_update": true
 }
